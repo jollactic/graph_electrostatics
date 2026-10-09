@@ -234,3 +234,35 @@ handled explicitly. The k=0 term is masked by `k0_mask`.
 `pbc_handling="realspace"` delegates to
 `RealSpaceFiniteDifferenceElectrostaticFeatures`. This uses finite differences for
 dipoles and is intended for open boundary conditions.
+
+
+## Fixed Yukawa screening for periodic features
+
+`compute_yukawa_factor(k_norm2, kappa)` returns `1 / (k_norm2 + kappa**2)`,
+including `1 / kappa**2` at zero. `kappa` must be finite and positive, in inverse
+Angstrom. Call `descriptor.configure_yukawa(kappa)` once, then reuse geometry
+with `descriptor.forward_dynamic_yukawa(cache, source_feats, k_factor_yukawa)`.
+The factor can be precomputed once per geometry. Reconfigure self terms whenever
+changing kappa. This evaluator supports isolated real-space and fully periodic bulk geometry.
+Slab and molecule-in-box Coulomb correction modes are not supported for spin Yukawa.
+
+Assembly retains `(2*pi)**3 / volume`, kernel application retains
+`FIELD_CONSTANT`, and projection retains `1 / (2*pi)**3` and the half-weight
+zero mode. No additional `4*pi` or volume factor is applied. Self exclusion uses
+the isolated Yukawa self projection when `include_self_interaction=False`.
+
+MACE-POLAR exposes `spin_yukawa_kappa` in its constructor and training CLI.
+For an existing model, use `model.set_spin_yukawa(0.5)` to enable screening,
+and `model.set_spin_yukawa(None)` to restore the original Coulomb spin path.
+Charge sources use Coulomb; spin sources use Yukawa; the resulting features are
+recombined into alpha and beta before the existing feature normalization.
+The explicit charge Coulomb energy is unchanged.
+
+For isolated systems, the scalar pair kernel is the Gaussian convolution of
+`exp(-kappa*r)/r`, with Fourier transform
+`4*pi*exp(-a*k**2)/(k**2+kappa**2)`, where
+`a = (sigma_source**2 + sigma_receiver**2)/2`. It is evaluated using `erfcx`
+for numerical stability. Dipoles retain the existing displaced-scalar finite
+difference approximation, so finite offset errors remain. Isolated self terms
+are added only when self interaction is enabled, using the same Yukawa self
+coefficients that are subtracted from the periodic result when it is disabled.

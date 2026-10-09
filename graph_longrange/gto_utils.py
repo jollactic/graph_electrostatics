@@ -315,6 +315,34 @@ class GTOSelfInteractionBlock(torch.nn.Module):
         return features
 
 
+class GTOYukawaSelfInteractionBlock(GTOSelfInteractionBlock):
+    """Isolated GTO self projection for a fixed positive screening wavevector."""
+
+    def __init__(self, l_source, sigma_source, l_receive, sigmas_receive,
+                 normalize_source, normalize_receive, kappa):
+        super().__init__(l_source, sigma_source, l_receive, sigmas_receive,
+                         normalize_source, normalize_receive)
+        if not np.isfinite(kappa) or kappa <= 0:
+            raise ValueError("Yukawa kappa must be finite and positive (inverse Angstrom).")
+        values = np.zeros(self.non_zero_terms)
+        for l in range(min(l_source, l_receive) + 1):
+            for n, sigma_receive in enumerate(sigmas_receive):
+                a = (sigma_source**2 + sigma_receive**2) / 2
+                radial, _ = scipy.integrate.quad(
+                    lambda t: t**(2*l+2) * np.exp(-t*t)
+                    / (t*t + a*kappa*kappa), 0, np.inf,
+                    epsabs=1e-12, epsrel=1e-12,
+                )
+                pref = (4*pi*np.sqrt(pi/2))**2
+                pref *= sigma_source**(3+2*l) * sigma_receive**(3+2*l)
+                pref *= get_Cl_sigma(l, sigma_source, normalize_source)
+                pref *= get_Cl_sigma(l, sigma_receive, normalize_receive)
+                value = FIELD_CONSTANT / (2*pi)**3 * pref * radial / a**(l+0.5)
+                start = len(sigmas_receive)*l*l + n*(2*l+1)
+                values[start:start+2*l+1] = value
+        self.overlap_constants = torch.as_tensor(values, dtype=torch.get_default_dtype())
+
+
 class DisplacedGTOExternalFieldBlock(torch.nn.Module):
     def __init__(
         self, l_receive: int, sigmas_receive: List[float], normalize_receive: str

@@ -7,10 +7,13 @@
 
 from typing import Callable, List, Literal, Optional
 
+import math
+
 import torch
 from scipy.constants import pi
 
-from .gto_utils import GTOBasis, GTOSelfInteractionBlock, GTOInternalFieldtoFeaturesBlock
+from .gto_utils import (GTOBasis, GTOSelfInteractionBlock, GTOInternalFieldtoFeaturesBlock,
+                        GTOYukawaSelfInteractionBlock)
 from .realspace_electrostatics import RealSpaceFiniteDifferenceElectrostaticFeatures
 from .slabs import (
     CorrectivePotentialBlock,
@@ -78,6 +81,13 @@ def compute_coulomb_factor(
     k0_mask_bool = k0_mask > 0.0
     safe_k_norm2 = torch.where(k0_mask_bool, torch.ones_like(k_norm2), k_norm2)
     return (~k0_mask_bool).to(k_norm2.dtype) / safe_k_norm2
+
+
+def compute_yukawa_factor(k_norm2: torch.Tensor, kappa: float) -> torch.Tensor:
+    """Screened kernel, including 1/kappa**2 at zero; no extra Fourier factors."""
+    if not math.isfinite(kappa) or kappa <= 0:
+        raise ValueError("Yukawa kappa must be finite and positive (inverse Angstrom).")
+    return 1.0 / (k_norm2 + kappa**2)
 
 
 def apply_coulomb_kernel_batch(
@@ -451,6 +461,59 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             source_feats=source_feats,
             cache=cache,
         )
+
+    def configure_yukawa(self, kappa: float) -> None:
+        """Configure fixed screened self terms without changing Coulomb behavior."""
+        if not math.isfinite(kappa) or kappa <= 0:
+            raise ValueError("Yukawa kappa must be finite and positive (inverse Angstrom).")
+        self.yukawa_self_interaction_terms = GTOYukawaSelfInteractionBlock(
+            l_source=self.density_basis.max_l,
+            sigma_source=self.density_basis.sigmas[0],
+            l_receive=self.feature_basis.max_l,
+            sigmas_receive=self.feature_basis.sigmas,
+            normalize_source="multipoles",
+            normalize_receive=self.feature_basis.normalize,
+            kappa=kappa,
+        ).to(self.density_basis.cl_scale)
+
+        self.realspace_yukawa_features = RealSpaceFiniteDifferenceElectrostaticFeatures(
+            density_max_l=self.density_basis.max_l,
+            density_smearing_width=self.density_basis.sigmas[0],
+            projection_max_l=self.feature_basis.max_l,
+            projection_smearing_widths=self.feature_basis.sigmas,
+            include_self_interaction=self.include_self_interaction,
+            integral_normalization=self.feature_basis.normalize,
+            yukawa_kappa=kappa,
+        ).to(self.density_basis.cl_scale)
+
+    def forward_dynamic_yukawa(
+        self, cache: dict, source_feats: torch.Tensor,
+        k_factor_yukawa: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Isolated or bulk periodic screened features with matching normalization."""
+        if cache.get("mode") == "realspace":
+            features, _, _ = self.realspace_yukawa_features(
+                source_feats, cache["node_positions"], cache["batch"],
+            )
+            return features
+        self._require_cache_mode(cache, "pbc")
+        if not bool(torch.all(cache["pbc"])):
+            raise ValueError("Spin Yukawa supports isolated realspace or fully periodic geometries.")
+        if k_factor_yukawa is None:
+            raise ValueError("Periodic Yukawa features require a precomputed kernel factor.")
+        density = assemble_fourier_series_batch(
+            source_feats, cache["cosines"], cache["sines"],
+            cache["density_basis_fs"], cache["volume_per_k"],
+        )
+        potential = apply_coulomb_kernel_batch(density, k_factor_yukawa)
+        features = project_to_features_batch(
+            potential, cache["feature_basis_fs"], cache["cosines"],
+            cache["sines"], cache["k_factor_proj"],
+        )
+        features = self._permute_output_channels(features.reshape(features.size(0), -1))
+        if not self.include_self_interaction:
+            features = features - self.yukawa_self_interaction_terms(source_feats)
+        return features
 
     def _precompute_geometry_realspace(
         self,

@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import warnings
 from .gto_utils import (
     GTOSelfInteractionBlock,
+    GTOYukawaSelfInteractionBlock,
     get_Cl_sigma,
 )
 
@@ -212,12 +213,34 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
             return self.energy_l1(source_feats, positions, batch)
 
 
+def gaussian_yukawa_kernel(distances, width, kappa):
+    """Gaussian-convolved exp(-kappa*r)/r; width**2 is Fourier Gaussian a.
+
+    Stable erfcx evaluation avoids exp(a*kappa**2) overflow. The Fourier
+    transform is 4*pi*exp(-a*k**2)/(k**2+kappa**2).
+    """
+    a = width**2
+    r = distances
+    x_minus = kappa*width - r/(2*width)
+    x_plus = kappa*width + r/(2*width)
+    gaussian = torch.exp(-r*r/(4*a))
+    positive = gaussian * torch.special.erfcx(torch.clamp_min(x_minus, 0.0))
+    negative = torch.exp(torch.clamp_max(a*kappa**2-kappa*r, 0.0)) * torch.erfc(x_minus)
+    first = torch.where(x_minus >= 0, positive, negative)
+    second = gaussian * torch.special.erfcx(x_plus)
+    safe_r = torch.clamp_min(r, 1e-7)
+    result = (first-second)/(2*safe_r)
+    at_zero = 1/(pi**0.5*width) - kappa*torch.special.erfcx(kappa*width)
+    return torch.where(r < 1e-7, at_zero, result)
+
+
 def charges_features_from_graph(
     charges,  # [n_atoms]
     positions,
     edge_index,
     batch,
     total_width_factors,  # [1, n_radial]
+    yukawa_kappa=None,
 ):
     """
     Computes the features from a collection of charges, on set of scalar features, considering only specified edges.
@@ -227,7 +250,10 @@ def charges_features_from_graph(
     sender, receiver = edge_index
     R_ij = positions[sender] - positions[receiver]  # [N_edges,3]
     d_ij = torch.norm(R_ij, dim=-1, keepdim=True)  # [N_edges,1]
-    smooth_reciprocal = torch.erf(0.5 * d_ij / total_width_factors) / (d_ij + 1e-6)
+    if yukawa_kappa is None:
+        smooth_reciprocal = torch.erf(0.5 * d_ij / total_width_factors) / (d_ij + 1e-6)
+    else:
+        smooth_reciprocal = gaussian_yukawa_kernel(d_ij, total_width_factors, yukawa_kappa)
 
     features = scatter_sum(
         charges[sender].unsqueeze(-1) * smooth_reciprocal,
@@ -253,6 +279,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         include_self_interaction=False,
         integral_normalization="receiver",
         offset: float = 0.1,
+        yukawa_kappa: Optional[float] = None,
     ):
         super().__init__()
 
@@ -271,6 +298,14 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             "multipoles",
             integral_normalization,
         )
+
+        self.yukawa_kappa = yukawa_kappa
+        if yukawa_kappa is not None:
+            self.self_interaction = GTOYukawaSelfInteractionBlock(
+                density_max_l, density_smearing_width, projection_max_l,
+                projection_smearing_widths, "multipoles", integral_normalization,
+                yukawa_kappa,
+            )
 
         projection_smearing_widths_tensor = torch.tensor(
             projection_smearing_widths, dtype=torch.get_default_dtype()
@@ -328,6 +363,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             edge_index=edge_long_index,
             batch=batch,
             total_width_factors=self.total_width_factors.unsqueeze(0),
+            yukawa_kappa=getattr(self, "yukawa_kappa", None),
         )  # [n_atoms, n_radial]
         return self.l0_factors * feats
 
@@ -360,6 +396,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             edge_index=edge_index,
             batch=extended_batch,
             total_width_factors=self.total_width_factors.unsqueeze(0),
+            yukawa_kappa=getattr(self, "yukawa_kappa", None),
         )  # [all_nodes, num_radial]
 
         all_features = source_feats.new_zeros(
